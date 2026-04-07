@@ -2,6 +2,7 @@
 NSCLC-Radiomics Dataset loader.
 Reads CT volumes + segmentation masks from DICOM, merges with clinical EHR data,
 and prepares samples for the USCNet model.
+EHR data is converted to natural language text for ClinicalBERT encoding.
 """
 
 import os
@@ -28,13 +29,7 @@ LABEL_MAP = {
     "nos": 3,
 }
 
-STAGE_MAP = {
-    "I": 0, "II": 1, "IIIa": 2, "IIIb": 3, "IV": 4,
-}
-
-GENDER_MAP = {"male": 0, "female": 1}
-
-EHR_FEATURE_DIM = 7  # age, T, N, M, overall_stage, gender, survival_time
+NUM_CLASSES = len(LABEL_MAP)
 
 
 def fix_path(path: str) -> str:
@@ -87,24 +82,37 @@ def load_segmentation(directory: str) -> np.ndarray:
         return None
 
 
-def normalize_ehr(row: pd.Series) -> np.ndarray:
-    """Extract and normalize EHR features from a clinical data row."""
-    age = float(row.get("age", 0)) / 100.0
-    t_stage = float(row.get("clinical.T.Stage", 0)) / 4.0
-    n_stage = float(row.get("Clinical.N.Stage", 0)) / 3.0
-    m_stage = float(row.get("Clinical.M.Stage", 0))
+def row_to_ehr_text(row: pd.Series) -> str:
+    """
+    Convert a structured EHR row into natural language clinical text
+    suitable for ClinicalBERT tokenization, following the USCNet paper.
+    """
+    age = row.get("age", "unknown")
+    gender = row.get("gender", "unknown")
+    t_stage = row.get("clinical.T.Stage", "unknown")
+    n_stage = row.get("Clinical.N.Stage", "unknown")
+    m_stage = row.get("Clinical.M.Stage", "unknown")
+    overall_stage = row.get("Overall.Stage", "unknown")
+    histology = row.get("Histology", "unknown")
+    survival = row.get("Survival.time", "unknown")
+    dead = row.get("deadstatus.event", "unknown")
 
-    overall = STAGE_MAP.get(str(row.get("Overall.Stage", "I")), 0) / 4.0
-    gender = float(GENDER_MAP.get(str(row.get("gender", "male")), 0))
-    surv = float(row.get("Survival.time", 0)) / 4000.0
+    status = "deceased" if str(dead) == "1" else "alive"
 
-    return np.array([age, t_stage, n_stage, m_stage, overall, gender, surv],
-                    dtype=np.float32)
+    text = (
+        f"Patient is a {age:.1f} year old {gender}. "
+        f"Clinical staging: T{t_stage} N{n_stage} M{m_stage}, overall stage {overall_stage}. "
+        f"Histological diagnosis: {histology}. "
+        f"Survival time: {survival} days, status: {status}."
+    )
+    return text
 
 
 class NSCLCDataset(Dataset):
     """
-    Dataset for NSCLC-Radiomics with CT, Segmentation masks, and EHR data.
+    Dataset for NSCLC-Radiomics with CT, Segmentation masks, and EHR text.
+
+    EHR fields are serialized into natural language text for ClinicalBERT.
 
     Args:
         metadata_csv: Path to phase1_metadata CSV (patient_id, ct_path, seg_path).
@@ -133,7 +141,6 @@ class NSCLCDataset(Dataset):
             clinical_df, left_on="patient_id", right_on="PatientID", how="inner"
         )
 
-        # Filter out NA histology and patients without valid labels
         merged = merged[merged["Histology"].notna()]
         merged = merged[merged["Histology"].str.lower().isin(LABEL_MAP.keys())]
         merged = merged.reset_index(drop=True)
@@ -190,7 +197,7 @@ class NSCLCDataset(Dataset):
         if seg_mask.shape != ct_volume.shape:
             from scipy.ndimage import zoom
             zoom_factors = tuple(t / s for s, t in zip(seg_mask.shape, ct_volume.shape))
-            seg_mask = zoom(seg_mask, zoom_factors, order=0)  # nearest-neighbor for masks
+            seg_mask = zoom(seg_mask, zoom_factors, order=0)
             seg_mask = (seg_mask > 0.5).astype(np.float32)
 
         # Window/level for lung CT (HU: -1000 to 400)
@@ -210,13 +217,12 @@ class NSCLCDataset(Dataset):
         if self.augment is not None:
             ct_tensor = self.augment(ct_tensor)
 
-        ehr = normalize_ehr(row)
-        ehr_tensor = torch.from_numpy(ehr)
+        ehr_text = row_to_ehr_text(row)
 
         return {
             "ct": ct_tensor,            # (1, D, H, W)
             "seg_gt": seg_tensor,        # (1, D, H, W)
-            "ehr": ehr_tensor,           # (EHR_FEATURE_DIM,)
+            "ehr_text": ehr_text,        # str - natural language for ClinicalBERT
             "label": torch.tensor(label, dtype=torch.long),
             "patient_id": row["patient_id"],
         }

@@ -38,6 +38,22 @@ from dataset import NSCLCDataset
 from utils import USCNetLoss, DynamicWeightAdjuster, compute_metrics, compute_dice_score
 
 
+def collate_fn(batch):
+    """Custom collate that keeps ehr_text as a list of strings."""
+    ct = torch.stack([b["ct"] for b in batch])
+    seg_gt = torch.stack([b["seg_gt"] for b in batch])
+    labels = torch.stack([b["label"] for b in batch])
+    ehr_text = [b["ehr_text"] for b in batch]
+    patient_ids = [b["patient_id"] for b in batch]
+    return {
+        "ct": ct,
+        "seg_gt": seg_gt,
+        "ehr_text": ehr_text,
+        "label": labels,
+        "patient_id": patient_ids,
+    }
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="USCNet Training for NSCLC-Radiomics")
 
@@ -122,13 +138,13 @@ def train_one_epoch(
     for step, batch in enumerate(dataloader):
         ct = batch["ct"].to(device, non_blocking=True)
         seg_gt = batch["seg_gt"].to(device, non_blocking=True)
-        ehr = batch["ehr"].to(device, non_blocking=True)
+        ehr_text = batch["ehr_text"]  # list of strings for ClinicalBERT
         labels = batch["label"].to(device, non_blocking=True)
 
         optimizer.zero_grad()
 
         with autocast(enabled=args.amp):
-            seg_pred, cls_pred = model(ct, ehr)
+            seg_pred, cls_pred = model(ct, ehr_text)
             losses = criterion(seg_pred, seg_gt, cls_pred, labels)
 
         scaler.scale(losses["total"]).backward()
@@ -186,11 +202,11 @@ def validate(model, dataloader, criterion, device, args):
     for batch in dataloader:
         ct = batch["ct"].to(device, non_blocking=True)
         seg_gt = batch["seg_gt"].to(device, non_blocking=True)
-        ehr = batch["ehr"].to(device, non_blocking=True)
+        ehr_text = batch["ehr_text"]  # list of strings for ClinicalBERT
         labels = batch["label"].to(device, non_blocking=True)
 
         with autocast(enabled=args.amp):
-            seg_pred, cls_pred = model(ct, ehr)
+            seg_pred, cls_pred = model(ct, ehr_text)
             losses = criterion(seg_pred, seg_gt, cls_pred, labels)
 
         total_loss += losses["total"].item()
@@ -272,6 +288,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
+        collate_fn=collate_fn,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -280,6 +297,7 @@ def main():
         sampler=val_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
+        collate_fn=collate_fn,
     )
 
     # -----------------------------------------------------------------------
@@ -306,7 +324,8 @@ def main():
     optimizer = torch.optim.AdamW(
         [
             {"params": raw_model.vit_encoder.parameters(), "lr": args.lr * 0.1},
-            {"params": raw_model.ehr_projection.parameters(), "lr": args.lr},
+            {"params": raw_model.clinical_bert.projection.parameters(), "lr": args.lr},
+            {"params": raw_model.clinical_bert.norm.parameters(), "lr": args.lr},
             {"params": raw_model.seg_decoder.parameters(), "lr": args.lr},
             {"params": raw_model.msaf.parameters(), "lr": args.lr},
             {"params": raw_model.classifier.parameters(), "lr": args.lr},
@@ -355,13 +374,14 @@ def main():
         # Freeze / Unfreeze logic
         if epoch == args.freeze_epochs:
             raw_model.unfreeze_backbone()
-            log(f"[Epoch {epoch}] Backbone UNFROZEN - full fine-tuning begins", rank)
+            log(f"[Epoch {epoch}] ViT UNFROZEN - fine-tuning begins (BERT stays frozen)", rank)
 
-            # Reset optimizer to include backbone with proper LR
+            # Reset optimizer — ViT gets a lower LR, BERT projection stays at full LR
             optimizer = torch.optim.AdamW(
                 [
                     {"params": raw_model.vit_encoder.parameters(), "lr": args.lr * 0.01},
-                    {"params": raw_model.ehr_projection.parameters(), "lr": args.lr},
+                    {"params": raw_model.clinical_bert.projection.parameters(), "lr": args.lr},
+                    {"params": raw_model.clinical_bert.norm.parameters(), "lr": args.lr},
                     {"params": raw_model.seg_decoder.parameters(), "lr": args.lr},
                     {"params": raw_model.msaf.parameters(), "lr": args.lr},
                     {"params": raw_model.classifier.parameters(), "lr": args.lr},

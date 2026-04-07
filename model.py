@@ -4,6 +4,8 @@ Adapted for NSCLC-Radiomics histology classification.
 
 Architecture modules:
   (a) Visual and Textual Transformation (VTT)
+      - Visual: 3D Patch Embedding + ViT Encoder (pretrained ViT-B/16)
+      - Textual: ClinicalBERT (pretrained Bio_ClinicalBERT) for EHR text
   (b) ViT-UNetSeg Module
   (c) MSAF Feature Fusion Module (CEA + SMA)
   (d) Classification Module
@@ -15,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from timm.models.vision_transformer import VisionTransformer
+from transformers import AutoTokenizer, AutoModel
 import timm
 
 
@@ -43,30 +46,55 @@ class PatchEmbedding3D(nn.Module):
         return x, (D, H, W)
 
 
-class EHRProjection(nn.Module):
-    """Project EHR tabular features to transformer embedding space."""
+class ClinicalBERTEncoder(nn.Module):
+    """
+    Textual Transformation using ClinicalBERT (Bio_ClinicalBERT).
+    Converts EHR text into contextual embeddings as per the USCNet paper.
+    The projection layer maps BERT hidden dim to the ViT embed_dim.
+    """
 
-    def __init__(self, ehr_dim=7, embed_dim=768, num_tokens=4):
+    def __init__(self, embed_dim=768, bert_model_name="emilyalsentzer/Bio_ClinicalBERT",
+                 max_length=128):
         super().__init__()
-        self.num_tokens = num_tokens
-        self.projection = nn.Sequential(
-            nn.Linear(ehr_dim, 256),
-            nn.GELU(),
-            nn.LayerNorm(256),
-            nn.Linear(256, 512),
-            nn.GELU(),
-            nn.LayerNorm(512),
-            nn.Linear(512, embed_dim * num_tokens),
-        )
+        self.max_length = max_length
+        self.tokenizer = AutoTokenizer.from_pretrained(bert_model_name)
+        self.bert = AutoModel.from_pretrained(bert_model_name)
+        bert_hidden = self.bert.config.hidden_size  # 768 for Bio_ClinicalBERT
+        self.projection = nn.Linear(bert_hidden, embed_dim) if bert_hidden != embed_dim else nn.Identity()
         self.norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, x):
-        # x: (B, ehr_dim)
-        B = x.shape[0]
-        x = self.projection(x)  # (B, embed_dim * num_tokens)
-        x = x.view(B, self.num_tokens, -1)  # (B, num_tokens, embed_dim)
-        x = self.norm(x)
-        return x
+    def freeze_bert(self):
+        for param in self.bert.parameters():
+            param.requires_grad = False
+
+    def unfreeze_bert(self):
+        for param in self.bert.parameters():
+            param.requires_grad = True
+
+    def forward(self, text_list: list[str], device: torch.device) -> torch.Tensor:
+        """
+        Args:
+            text_list: List of B clinical text strings.
+            device: Target device for output tensors.
+        Returns:
+            (B, seq_len, embed_dim) - contextual token embeddings from ClinicalBERT.
+        """
+        encoded = self.tokenizer(
+            text_list,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        input_ids = encoded["input_ids"].to(device)
+        attention_mask = encoded["attention_mask"].to(device)
+
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        hidden = outputs.last_hidden_state  # (B, seq_len, bert_hidden)
+
+        projected = self.projection(hidden)  # (B, seq_len, embed_dim)
+        projected = self.norm(projected)
+        return projected
 
 
 # ---------------------------------------------------------------------------
@@ -469,8 +497,10 @@ class USCNet(nn.Module):
     USCNet: Transformer-Based Multimodal Fusion with Segmentation Guidance.
 
     Adapted for NSCLC-Radiomics dataset.
-    Input: CT volume (B,1,D,H,W), EHR features (B,7)
+    Input: CT volume (B,1,D,H,W), EHR text (list of B strings)
     Output: Segmentation mask (B,1,D,H,W), Classification logits (B,num_classes)
+
+    Textual branch uses ClinicalBERT (Bio_ClinicalBERT) as per the paper.
     """
 
     def __init__(
@@ -480,17 +510,17 @@ class USCNet(nn.Module):
         depth: int = 12,
         num_heads: int = 12,
         patch_size: tuple = (8, 16, 16),
-        ehr_dim: int = 7,
-        ehr_tokens: int = 4,
         num_classes: int = 4,
         drop_rate: float = 0.1,
         seg_channels: int = 64,
+        bert_model_name: str = "emilyalsentzer/Bio_ClinicalBERT",
+        bert_max_length: int = 128,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_classes = num_classes
 
-        # (a) Visual Transformation
+        # (a) Visual Transformation — ViT Encoder
         self.vit_encoder = VisualTransformerEncoder(
             in_channels=in_channels,
             embed_dim=embed_dim,
@@ -500,9 +530,11 @@ class USCNet(nn.Module):
             drop_rate=drop_rate,
         )
 
-        # (a) Textual Transformation (EHR Projection)
-        self.ehr_projection = EHRProjection(
-            ehr_dim=ehr_dim, embed_dim=embed_dim, num_tokens=ehr_tokens,
+        # (a) Textual Transformation — ClinicalBERT
+        self.clinical_bert = ClinicalBERTEncoder(
+            embed_dim=embed_dim,
+            bert_model_name=bert_model_name,
+            max_length=bert_max_length,
         )
 
         # (b) ViT-UNetSeg Decoder
@@ -522,37 +554,41 @@ class USCNet(nn.Module):
         )
 
     def load_pretrained(self):
-        """Load pretrained weights for ViT encoder blocks."""
+        """Load pretrained weights for ViT encoder blocks.
+        ClinicalBERT is already pretrained upon construction."""
         self.vit_encoder.load_pretrained_weights()
 
     def freeze_backbone(self):
-        """Freeze all pretrained backbone weights."""
+        """Freeze ViT encoder and permanently freeze ClinicalBERT."""
         for param in self.vit_encoder.blocks.parameters():
             param.requires_grad = False
         for param in self.vit_encoder.norm.parameters():
             param.requires_grad = False
+        self.clinical_bert.freeze_bert()
 
     def unfreeze_backbone(self):
-        """Unfreeze all backbone weights for fine-tuning."""
+        """Unfreeze ViT encoder for fine-tuning. ClinicalBERT stays frozen."""
         for param in self.vit_encoder.blocks.parameters():
             param.requires_grad = True
         for param in self.vit_encoder.norm.parameters():
             param.requires_grad = True
 
-    def forward(self, ct, ehr):
+    def forward(self, ct, ehr_text):
         """
         Args:
             ct: (B, 1, D, H, W) - CT volume
-            ehr: (B, ehr_dim) - EHR features
+            ehr_text: list[str] of length B - clinical text for ClinicalBERT
         Returns:
             seg_out: (B, 1, D, H, W) - Segmentation prediction
             cls_out: (B, num_classes) - Classification logits
         """
-        # (a) Visual transformation - ViT Encoder
+        device = ct.device
+
+        # (a) Visual transformation — ViT Encoder
         vit_out, hidden_states, spatial_shape = self.vit_encoder(ct)
 
-        # (a) Textual transformation - EHR Projection
-        ehr_tokens = self.ehr_projection(ehr)  # (B, num_tokens, embed_dim)
+        # (a) Textual transformation — ClinicalBERT
+        ehr_tokens = self.clinical_bert(ehr_text, device)  # (B, seq_len, embed_dim)
 
         # (b) ViT-UNetSeg: Decode segmentation from multi-scale features
         seg_out, seg_features = self.seg_decoder(hidden_states, spatial_shape)
@@ -565,7 +601,7 @@ class USCNet(nn.Module):
         # Average pool the ViT output (excluding CLS) as CT representation
         ct_feat = vit_out[:, 1:]  # remove CLS, (B, N, embed_dim)
 
-        # (c) MSAF: Fuse CT, EHR, and segmentation features
+        # (c) MSAF: Fuse CT (Q), EHR/ClinicalBERT (K,V), and segmentation features
         fused = self.msaf(ct_feat, ehr_tokens, seg_features)
 
         # Global average pooling over sequence dimension
@@ -578,18 +614,18 @@ class USCNet(nn.Module):
 
 
 def build_model(args) -> USCNet:
-    """Factory function to build the USCNet model."""
+    """Factory function to build the USCNet model with pretrained backbones."""
     model = USCNet(
         in_channels=1,
         embed_dim=768,
         depth=12,
         num_heads=12,
         patch_size=(8, 16, 16),
-        ehr_dim=7,
-        ehr_tokens=4,
         num_classes=4,
         drop_rate=getattr(args, "drop_rate", 0.1),
         seg_channels=64,
+        bert_model_name="emilyalsentzer/Bio_ClinicalBERT",
+        bert_max_length=128,
     )
     model.load_pretrained()
     return model
