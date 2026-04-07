@@ -176,13 +176,22 @@ class NSCLCDataset(Dataset):
         if seg_mask is None:
             seg_mask = np.zeros_like(ct_volume)
 
-        # Pad or crop depth to match if needed
+        # Ensure both are 3D (D, H, W)
+        if ct_volume.ndim == 2:
+            ct_volume = ct_volume[np.newaxis]
+        if seg_mask.ndim == 2:
+            seg_mask = seg_mask[np.newaxis]
+        if ct_volume.ndim == 4:
+            ct_volume = ct_volume.squeeze(0) if ct_volume.shape[0] == 1 else ct_volume[..., 0]
+        if seg_mask.ndim == 4:
+            seg_mask = seg_mask.squeeze(0) if seg_mask.shape[0] == 1 else seg_mask[..., 0]
+
+        # Match seg mask to CT volume shape via resize/crop/pad
         if seg_mask.shape != ct_volume.shape:
-            target_shape = ct_volume.shape
-            padded = np.zeros(target_shape, dtype=np.float32)
-            slices = tuple(slice(0, min(s, t)) for s, t in zip(seg_mask.shape, target_shape))
-            padded[slices] = seg_mask[slices]
-            seg_mask = padded
+            from scipy.ndimage import zoom
+            zoom_factors = tuple(t / s for s, t in zip(seg_mask.shape, ct_volume.shape))
+            seg_mask = zoom(seg_mask, zoom_factors, order=0)  # nearest-neighbor for masks
+            seg_mask = (seg_mask > 0.5).astype(np.float32)
 
         # Window/level for lung CT (HU: -1000 to 400)
         ct_volume = np.clip(ct_volume, -1000, 400)
