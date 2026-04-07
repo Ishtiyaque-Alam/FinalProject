@@ -1,0 +1,213 @@
+"""
+NSCLC-Radiomics Dataset loader.
+Reads CT volumes + segmentation masks from DICOM, merges with clinical EHR data,
+and prepares samples for the USCNet model.
+"""
+
+import os
+import glob
+import numpy as np
+import pandas as pd
+import pydicom
+import SimpleITK as sitk
+import torch
+from torch.utils.data import Dataset
+from monai.transforms import (
+    Compose, RandFlip, RandRotate90, RandAffine,
+    ScaleIntensityRange, Resize, EnsureChannelFirst,
+    RandGaussianNoise, RandGaussianSmooth,
+)
+
+OLD_PREFIX = "/kaggle/input/nsclc-radiomics/NSCLC-Radiomics/"
+NEW_PREFIX = "/kaggle/input/datasets/umutkrdrms/nsclc-radiomics/NSCLC-Radiomics/"
+
+LABEL_MAP = {
+    "large cell": 0,
+    "squamous cell carcinoma": 1,
+    "adenocarcinoma": 2,
+    "nos": 3,
+}
+
+STAGE_MAP = {
+    "I": 0, "II": 1, "IIIa": 2, "IIIb": 3, "IV": 4,
+}
+
+GENDER_MAP = {"male": 0, "female": 1}
+
+EHR_FEATURE_DIM = 7  # age, T, N, M, overall_stage, gender, survival_time
+
+
+def fix_path(path: str) -> str:
+    """Replace old Kaggle prefix with new corrected prefix."""
+    return path.replace(OLD_PREFIX, NEW_PREFIX)
+
+
+def load_dicom_series(directory: str) -> np.ndarray:
+    """Load a DICOM series from a directory and return a 3D numpy array."""
+    reader = sitk.ImageSeriesReader()
+    dicom_files = reader.GetGDCMSeriesFileNames(directory)
+    if len(dicom_files) == 0:
+        dcm_files = sorted(glob.glob(os.path.join(directory, "*.dcm")))
+        if len(dcm_files) == 0:
+            dcm_files = sorted(glob.glob(os.path.join(directory, "*")))
+        dicom_files = dcm_files
+
+    reader.SetFileNames(dicom_files)
+    image = reader.Execute()
+    array = sitk.GetArrayFromImage(image)  # (D, H, W)
+    return array.astype(np.float32)
+
+
+def load_segmentation(directory: str) -> np.ndarray:
+    """Load segmentation mask from a DICOM-SEG or DICOM RT-STRUCT directory."""
+    try:
+        reader = sitk.ImageSeriesReader()
+        dicom_files = reader.GetGDCMSeriesFileNames(directory)
+        if len(dicom_files) == 0:
+            dcm_files = sorted(glob.glob(os.path.join(directory, "*")))
+            dicom_files = dcm_files
+        reader.SetFileNames(dicom_files)
+        image = reader.Execute()
+        array = sitk.GetArrayFromImage(image)
+        mask = (array > 0).astype(np.float32)
+        return mask
+    except Exception:
+        files = sorted(glob.glob(os.path.join(directory, "*")))
+        if len(files) == 0:
+            return None
+        try:
+            ds = pydicom.dcmread(files[0])
+            if hasattr(ds, "pixel_array"):
+                arr = ds.pixel_array.astype(np.float32)
+                if arr.ndim == 2:
+                    arr = arr[np.newaxis]
+                return (arr > 0).astype(np.float32)
+        except Exception:
+            pass
+        return None
+
+
+def normalize_ehr(row: pd.Series) -> np.ndarray:
+    """Extract and normalize EHR features from a clinical data row."""
+    age = float(row.get("age", 0)) / 100.0
+    t_stage = float(row.get("clinical.T.Stage", 0)) / 4.0
+    n_stage = float(row.get("Clinical.N.Stage", 0)) / 3.0
+    m_stage = float(row.get("Clinical.M.Stage", 0))
+
+    overall = STAGE_MAP.get(str(row.get("Overall.Stage", "I")), 0) / 4.0
+    gender = float(GENDER_MAP.get(str(row.get("gender", "male")), 0))
+    surv = float(row.get("Survival.time", 0)) / 4000.0
+
+    return np.array([age, t_stage, n_stage, m_stage, overall, gender, surv],
+                    dtype=np.float32)
+
+
+class NSCLCDataset(Dataset):
+    """
+    Dataset for NSCLC-Radiomics with CT, Segmentation masks, and EHR data.
+
+    Args:
+        metadata_csv: Path to phase1_metadata CSV (patient_id, ct_path, seg_path).
+        clinical_csv: Path to clinical CSV with EHR columns.
+        volume_size: Target (D, H, W) for resampled volumes.
+        is_train: Whether to apply data augmentation.
+    """
+
+    def __init__(
+        self,
+        metadata_csv: str,
+        clinical_csv: str,
+        volume_size: tuple = (64, 128, 128),
+        is_train: bool = True,
+    ):
+        self.volume_size = volume_size
+        self.is_train = is_train
+
+        meta_df = pd.read_csv(metadata_csv)
+        clinical_df = pd.read_csv(clinical_csv)
+
+        meta_df["ct_path"] = meta_df["ct_path"].apply(fix_path)
+        meta_df["seg_path"] = meta_df["seg_path"].apply(fix_path)
+
+        merged = meta_df.merge(
+            clinical_df, left_on="patient_id", right_on="PatientID", how="inner"
+        )
+
+        # Filter out NA histology and patients without valid labels
+        merged = merged[merged["Histology"].notna()]
+        merged = merged[merged["Histology"].str.lower().isin(LABEL_MAP.keys())]
+        merged = merged.reset_index(drop=True)
+
+        self.data = merged
+        self._build_transforms()
+
+    def _build_transforms(self):
+        """Build MONAI transforms for CT volumes."""
+        spatial_size = list(self.volume_size)
+
+        self.resize = Resize(spatial_size=spatial_size, mode="trilinear")
+        self.resize_seg = Resize(spatial_size=spatial_size, mode="nearest")
+
+        if self.is_train:
+            self.augment = Compose([
+                RandFlip(spatial_axis=0, prob=0.5),
+                RandFlip(spatial_axis=1, prob=0.5),
+                RandRotate90(prob=0.3, spatial_axes=(1, 2)),
+                RandGaussianNoise(prob=0.2, mean=0.0, std=0.05),
+                RandGaussianSmooth(prob=0.1),
+            ])
+        else:
+            self.augment = None
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+
+        ct_path = row["ct_path"]
+        seg_path = row["seg_path"]
+        label_str = str(row["Histology"]).lower().strip()
+        label = LABEL_MAP[label_str]
+
+        ct_volume = load_dicom_series(ct_path)
+        seg_mask = load_segmentation(seg_path)
+
+        if seg_mask is None:
+            seg_mask = np.zeros_like(ct_volume)
+
+        # Pad or crop depth to match if needed
+        if seg_mask.shape != ct_volume.shape:
+            target_shape = ct_volume.shape
+            padded = np.zeros(target_shape, dtype=np.float32)
+            slices = tuple(slice(0, min(s, t)) for s, t in zip(seg_mask.shape, target_shape))
+            padded[slices] = seg_mask[slices]
+            seg_mask = padded
+
+        # Window/level for lung CT (HU: -1000 to 400)
+        ct_volume = np.clip(ct_volume, -1000, 400)
+        ct_volume = (ct_volume - (-1000)) / (400 - (-1000))
+
+        # Add channel dimension: (1, D, H, W)
+        ct_volume = ct_volume[np.newaxis]
+        seg_mask = seg_mask[np.newaxis]
+
+        ct_tensor = torch.from_numpy(ct_volume)
+        seg_tensor = torch.from_numpy(seg_mask)
+
+        ct_tensor = self.resize(ct_tensor)
+        seg_tensor = self.resize_seg(seg_tensor)
+
+        if self.augment is not None:
+            ct_tensor = self.augment(ct_tensor)
+
+        ehr = normalize_ehr(row)
+        ehr_tensor = torch.from_numpy(ehr)
+
+        return {
+            "ct": ct_tensor,            # (1, D, H, W)
+            "seg_gt": seg_tensor,        # (1, D, H, W)
+            "ehr": ehr_tensor,           # (EHR_FEATURE_DIM,)
+            "label": torch.tensor(label, dtype=torch.long),
+            "patient_id": row["patient_id"],
+        }
