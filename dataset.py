@@ -86,6 +86,8 @@ def row_to_ehr_text(row: pd.Series) -> str:
     """
     Convert a structured EHR row into natural language clinical text
     suitable for ClinicalBERT tokenization, following the USCNet paper.
+
+    NOTE: Histology is excluded — it is the prediction target.
     """
     age = row.get("age", "unknown")
     gender = row.get("gender", "unknown")
@@ -93,7 +95,6 @@ def row_to_ehr_text(row: pd.Series) -> str:
     n_stage = row.get("Clinical.N.Stage", "unknown")
     m_stage = row.get("Clinical.M.Stage", "unknown")
     overall_stage = row.get("Overall.Stage", "unknown")
-    histology = row.get("Histology", "unknown")
     survival = row.get("Survival.time", "unknown")
     dead = row.get("deadstatus.event", "unknown")
 
@@ -101,9 +102,9 @@ def row_to_ehr_text(row: pd.Series) -> str:
 
     text = (
         f"Patient is a {age:.1f} year old {gender}. "
+        f"Diagnosed with non-small cell lung cancer. "
         f"Clinical staging: T{t_stage} N{n_stage} M{m_stage}, overall stage {overall_stage}. "
-        f"Histological diagnosis: {histology}. "
-        f"Survival time: {survival} days, status: {status}."
+        f"Survival time: {survival} days, patient status: {status}."
     )
     return text
 
