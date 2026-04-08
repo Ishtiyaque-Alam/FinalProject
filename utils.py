@@ -1,5 +1,11 @@
 """
 Loss functions, metrics, and training utilities for USCNet.
+
+Improvements over v1:
+  - Class-weighted CrossEntropy: weights inversely proportional to class frequency.
+  - Label smoothing in CrossEntropy to reduce overconfidence.
+  - Class-weighted FocalLoss: per-sample alpha from class weights tensor.
+  - compute_class_weights() helper used in train.py.
 """
 
 import torch
@@ -11,6 +17,35 @@ from sklearn.metrics import (
     confusion_matrix, classification_report,
 )
 
+
+# ---------------------------------------------------------------------------
+# Class-weight helper
+# ---------------------------------------------------------------------------
+
+def compute_class_weights(labels: list, num_classes: int = 4,
+                           device: torch.device = None) -> torch.Tensor:
+    """
+    Compute inverse-frequency class weights from a list of integer labels.
+    Weight for class c = total_samples / (num_classes * count_c).
+    Returns a float tensor of shape (num_classes,).
+    """
+    labels = np.array(labels)
+    weights = np.zeros(num_classes, dtype=np.float32)
+    total = len(labels)
+    for c in range(num_classes):
+        count = (labels == c).sum()
+        weights[c] = total / (num_classes * max(count, 1))
+    # Normalise so the mean weight is 1.0
+    weights = weights / weights.mean()
+    t = torch.tensor(weights, dtype=torch.float32)
+    if device is not None:
+        t = t.to(device)
+    return t
+
+
+# ---------------------------------------------------------------------------
+# Loss components
+# ---------------------------------------------------------------------------
 
 class DiceLoss(nn.Module):
     """Soft Dice loss for segmentation."""
@@ -32,18 +67,27 @@ class DiceLoss(nn.Module):
 
 
 class FocalLoss(nn.Module):
-    """Focal loss for imbalanced classification."""
+    """
+    Focal loss for imbalanced classification.
+    Supports a per-class alpha weight tensor (class_weights).
+    """
 
-    def __init__(self, alpha: float = 1.0, gamma: float = 2.0, reduction: str = "mean"):
+    def __init__(self, gamma: float = 2.0, reduction: str = "mean",
+                 class_weights: torch.Tensor = None):
         super().__init__()
-        self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
+        # Stored as a buffer so it moves to GPU with .to(device)
+        if class_weights is not None:
+            self.register_buffer("class_weights", class_weights)
+        else:
+            self.class_weights = None
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        ce_loss = F.cross_entropy(inputs, targets, reduction="none")
+        weight = self.class_weights if self.class_weights is not None else None
+        ce_loss = F.cross_entropy(inputs, targets, weight=weight, reduction="none")
         pt = torch.exp(-ce_loss)
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
 
         if self.reduction == "mean":
             return focal_loss.mean()
@@ -59,6 +103,12 @@ class USCNetLoss(nn.Module):
 
     Where L_dice is for segmentation, and L_bce + L_focal are for classification.
     Dynamic weight adjustment follows the paper.
+
+    Args:
+        num_classes: Number of output classes.
+        class_weights: (num_classes,) tensor of inverse-frequency class weights.
+                       Applied to both CE and Focal losses.
+        label_smoothing: Label smoothing epsilon for CrossEntropyLoss.
     """
 
     def __init__(
@@ -67,37 +117,42 @@ class USCNetLoss(nn.Module):
         lambda_dice: float = 1.0,
         lambda_bce: float = 1.0,
         lambda_focal: float = 1.0,
+        class_weights: torch.Tensor = None,
+        label_smoothing: float = 0.1,
     ):
         super().__init__()
         self.dice_loss = DiceLoss()
-        self.ce_loss = nn.CrossEntropyLoss()
-        self.focal_loss = FocalLoss(gamma=2.0)
+        self.ce_loss = nn.CrossEntropyLoss(
+            weight=class_weights,
+            label_smoothing=label_smoothing,
+        )
+        self.focal_loss = FocalLoss(gamma=2.0, class_weights=class_weights)
 
-        self.lambda_dice = nn.Parameter(torch.tensor(lambda_dice), requires_grad=False)
-        self.lambda_bce = nn.Parameter(torch.tensor(lambda_bce), requires_grad=False)
+        self.lambda_dice  = nn.Parameter(torch.tensor(lambda_dice),  requires_grad=False)
+        self.lambda_bce   = nn.Parameter(torch.tensor(lambda_bce),   requires_grad=False)
         self.lambda_focal = nn.Parameter(torch.tensor(lambda_focal), requires_grad=False)
 
     def forward(
         self,
-        seg_pred: torch.Tensor,
+        seg_pred:   torch.Tensor,
         seg_target: torch.Tensor,
-        cls_pred: torch.Tensor,
+        cls_pred:   torch.Tensor,
         cls_target: torch.Tensor,
     ) -> dict:
-        l_dice = self.dice_loss(seg_pred, seg_target)
-        l_bce = self.ce_loss(cls_pred, cls_target)
+        l_dice  = self.dice_loss(seg_pred, seg_target)
+        l_bce   = self.ce_loss(cls_pred, cls_target)
         l_focal = self.focal_loss(cls_pred, cls_target)
 
         total = (
-            self.lambda_dice * l_dice
-            + self.lambda_bce * l_bce
+            self.lambda_dice  * l_dice
+            + self.lambda_bce   * l_bce
             + self.lambda_focal * l_focal
         )
 
         return {
             "total": total,
-            "dice": l_dice.detach(),
-            "ce": l_bce.detach(),
+            "dice":  l_dice.detach(),
+            "ce":    l_bce.detach(),
             "focal": l_focal.detach(),
         }
 
@@ -130,15 +185,19 @@ class DynamicWeightAdjuster:
         self.prev_losses = losses.clone()
 
 
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
 def compute_metrics(all_preds: list, all_labels: list, num_classes: int = 4) -> dict:
     """Compute classification metrics."""
-    preds = np.array(all_preds)
+    preds  = np.array(all_preds)
     labels = np.array(all_labels)
 
-    acc = accuracy_score(labels, preds)
+    acc       = accuracy_score(labels, preds)
     precision = precision_score(labels, preds, average="macro", zero_division=0)
-    recall = recall_score(labels, preds, average="macro", zero_division=0)
-    f1 = f1_score(labels, preds, average="macro", zero_division=0)
+    recall    = recall_score(labels, preds, average="macro", zero_division=0)
+    f1        = f1_score(labels, preds, average="macro", zero_division=0)
 
     per_class_f1 = f1_score(labels, preds, average=None, zero_division=0)
 
@@ -148,19 +207,20 @@ def compute_metrics(all_preds: list, all_labels: list, num_classes: int = 4) -> 
     )
 
     return {
-        "accuracy": acc,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
+        "accuracy":     acc,
+        "precision":    precision,
+        "recall":       recall,
+        "f1":           f1,
         "per_class_f1": per_class_f1,
-        "report": report,
+        "report":       report,
     }
 
 
-def compute_dice_score(pred: torch.Tensor, target: torch.Tensor, smooth: float = 1.0) -> float:
+def compute_dice_score(pred: torch.Tensor, target: torch.Tensor,
+                       smooth: float = 1.0) -> float:
     """Compute Dice coefficient for segmentation evaluation."""
     pred = (torch.sigmoid(pred) > 0.5).float()
-    pred_flat = pred.view(-1)
-    target_flat = target.view(-1)
+    pred_flat    = pred.view(-1)
+    target_flat  = target.view(-1)
     intersection = (pred_flat * target_flat).sum()
     return (2.0 * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth)
